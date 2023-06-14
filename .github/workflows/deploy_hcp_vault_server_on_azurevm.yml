@@ -1,0 +1,122 @@
+name: Deploy Hashicorp Vault Server
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: false
+        type: string
+        description: Environment (variables set)
+        default: HATR Hai Tran
+      vaultServerName:
+        required: true
+        type: string
+        description: Vault server name
+        default: minivault
+      destroy:
+        required: false
+        type: boolean
+        description: Destroy resource
+        default: false
+jobs:
+  DeployVaultServer:
+    name: Deploy Vault Server
+    runs-on: "ubuntu-latest"
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      # Azure authentication variables
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      # backend configuration, git workflow will create an Azure remote backend resource based on below parameter
+      STORAGE_ACCOUNT_RG_NAME: ${{ github.event.inputs.vaultServerName  }}-backend
+      STORAGE_ACCOUNT_LOCATION: 'northeurope'
+      STORAGE_ACCOUNT_NAME: ${{ github.event.inputs.vaultServerName  }}backendsa
+      BACKEND_KEY: ${{ github.event.inputs.vaultServerName  }}
+      STORAGE_CONTAINER_NAME: "tfstate"
+
+      # variables for Terraform template
+      TF_VAR_vault_server_name: ${{ github.event.inputs.vaultServerName }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: setup utilities
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: setup terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.3.6
+          terraform_wrapper: false
+
+      - name: login azure
+        run: |
+          az version
+          az login --service-principal --username $ARM_CLIENT_ID --password $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+          az account set -s $ARM_SUBSCRIPTION_ID
+
+      - name: terraform backend
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./backend
+        run: |
+          . config_terraform_backend.sh
+
+      - name: terraform init
+        working-directory: ./single-vm
+        run: |
+          access_key=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --query "[0].value" -o tsv)
+
+          terraform init -backend-config=storage_account_name=$STORAGE_ACCOUNT_NAME \
+                         -backend-config=container_name=$STORAGE_CONTAINER_NAME \
+                         -backend-config=key=$BACKEND_KEY \
+                         -backend-config=access_key=$access_key \
+                         -reconfigure
+
+      - name: terraform plan
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./single-vm
+        run: |
+          terraform plan
+
+      - name: terraform apply
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./single-vm
+        run: |
+          terraform apply -auto-approve
+
+      - name: save SSH key
+        working-directory: ./single-vm
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        run: |
+          terraform output tls_private_key > ${{ github.event.inputs.vaultServerName  }}.pem
+          access_key=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --query "[0].value" -o tsv)
+
+          containerCount=$(az storage container list --account-name $STORAGE_ACCOUNT_NAME  --query "[?name=='sshkeys']" | jq -r '. | length')
+          if [[ 0 -eq $containerCount ]]
+          then
+              az storage container create --name sshkeys --account-name $STORAGE_ACCOUNT_NAME --output none
+              echo "INFO: storage account for storing ssh keys has been created successfully"
+          else
+              echo "INFO: container for storing ssh keys is exists. Ignore creating!"
+          fi
+
+          az storage blob upload --account-name $STORAGE_ACCOUNT_NAME --account-key $access_key --container-name sshkeys --file "${{ github.event.inputs.vaultServerName  }}.pem" --name "${{ github.event.inputs.vaultServerName  }}.pem" --overwrite
+
+      - name: destroy resource
+        working-directory: ./single-vm
+        if: ${{ github.event.inputs.destroy == 'true' }}
+        run: terraform destroy -auto-approve
+
+      - name: remove backend
+        if: ${{ github.event.inputs.destroy == 'true' }}
+        run: az group delete --name $STORAGE_ACCOUNT_RG_NAME --yes
+
+      - name: remove Network Watcher RG
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        run: |
+          if [ $(az group exists --name NetworkWatcherRG ) = true ]; then
+              az group delete -n NetworkWatcherRG --yes
+          fi

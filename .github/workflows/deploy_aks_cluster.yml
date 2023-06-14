@@ -1,0 +1,138 @@
+name: Deploy AKS Cluster
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: false
+        type: string
+        description: Environment (variables set)
+        default: HATR Hai Tran
+      clusterName:
+        required: true
+        type: string
+        description: AKS cluster name
+        default: vaulity
+      vaultServer:
+        required: true
+        type: string
+        description: Vault Server URL
+      vaultToken:
+        required: true
+        type: string
+        description: Vault Token
+      argocd_manifest_pat:
+        required: true
+        type: string
+        description: Manifests PAT
+      destroy:
+        required: false
+        type: boolean
+        description: Destroy resource
+        default: false
+jobs:
+  DeployAKSCluster:
+    name: Deploy AKS Cluster
+    runs-on: "ubuntu-latest"
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      # Azure authentication variables
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      # backend configuration, git workflow will create an Azure remote backend resource based on below parameter
+      STORAGE_ACCOUNT_RG_NAME: ${{ github.event.inputs.clusterName }}-backend
+      STORAGE_ACCOUNT_LOCATION: 'northeurope'
+      STORAGE_ACCOUNT_NAME: ${{ github.event.inputs.clusterName}}backendsa
+      BACKEND_KEY: ${{ github.event.inputs.clusterName }}
+      STORAGE_CONTAINER_NAME: "tfstate"
+
+      # variables for Terraform template main.tf
+      TF_VAR_cluster_name: ${{ github.event.inputs.clusterName}}
+      TF_VAR_aks_version: '1.26.3'
+
+      # variables for Vault provider
+      VAULT_ADDR: ${{ github.event.inputs.vaultServer }}
+      VAULT_TOKEN: ${{ github.event.inputs.vaultToken }}
+
+      TF_VAR_vault_server_url: ${{ github.event.inputs.vaultServer }}
+      TF_VAR_argocd_manifest_pat: ${{ github.event.inputs.argocd_manifest_pat}}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: setup utilities
+        run: |
+          sudo apt install -y jq
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install vault
+          vault version
+
+      - uses: azure/setup-helm@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: setup terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: login azure
+        run: |
+          az version
+          az login --service-principal --username $ARM_CLIENT_ID --password $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+          az account set -s $ARM_SUBSCRIPTION_ID
+
+      - name: terraform backend
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./backend
+        run: |
+          . config_terraform_backend.sh
+
+      - name: terraform init
+        working-directory: ./aks-cluster
+        run: |
+          access_key=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --query "[0].value" -o tsv)
+
+          terraform init -backend-config=storage_account_name=$STORAGE_ACCOUNT_NAME \
+                         -backend-config=container_name=$STORAGE_CONTAINER_NAME \
+                         -backend-config=key=$BACKEND_KEY \
+                         -backend-config=access_key=$access_key \
+                         -reconfigure
+
+      - name: terraform plan
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./aks-cluster
+        run: |
+          terraform plan
+
+      - name: terraform apply
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        working-directory: ./aks-cluster
+        run: |
+          terraform apply -auto-approve
+
+      - name: destroy resource
+        working-directory: ./aks-cluster
+        if: ${{ github.event.inputs.destroy == 'true' }}
+        run: terraform destroy -auto-approve
+
+      - name: remove backend
+        if: ${{ github.event.inputs.destroy == 'true' }}
+        run: az group delete --name $STORAGE_ACCOUNT_RG_NAME --yes
+
+      - name: remove Network Watcher RG
+        if: ${{ github.event.inputs.destroy == 'false' }}
+        run: |
+          if [ $(az group exists --name NetworkWatcherRG ) = true ]; then
+              az group delete -n NetworkWatcherRG --yes
+          fi

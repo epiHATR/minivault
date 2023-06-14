@@ -1,0 +1,97 @@
+name: Add Customer Project
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: false
+        type: string
+        description: Environment (variables set)
+        default: HATR Hai Tran
+      clusterName:
+        required: true
+        type: string
+        description: AKS cluster name
+        default: vaulity-aks
+      customerName:
+        required: true
+        type: string
+        description: Customer name
+        default: pentalog
+      vaultServer:
+        required: true
+        type: string
+        description: Vault Server URL
+        default: http://minivault-bluegill.northeurope.cloudapp.azure.com
+      vaultToken:
+        required: true
+        type: string
+        description: Vault Token
+jobs:
+  AddCustomer:
+    name: Add Customer
+    runs-on: "ubuntu-latest"
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      # Azure authentication variables
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      # variables for Vault provider
+      VAULT_ADDR: ${{ github.event.inputs.vaultServer }}
+      VAULT_TOKEN: ${{ github.event.inputs.vaultToken }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: setup utilities
+        run: |
+          sudo apt install -y jq
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install vault
+          vault version
+
+      - uses: azure/setup-helm@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: setup terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: login azure
+        run: |
+          az version
+          az login --service-principal --username $ARM_CLIENT_ID --password $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+          az account set -s $ARM_SUBSCRIPTION_ID
+
+      - name: create policy
+        run: |
+          tee -a policy.hcl > /dev/null <<EOT
+          path "customers/data/${{github.event.inputs.customerName}}/*" {
+              capabilities = [ "read", "list", "create", "update", "delete" ]
+          }
+          EOT
+          vault policy write ${{ github.event.inputs.customerName }} policy.hcl
+
+      - name: create auth role
+        run: |
+          vault write auth/kubernetes/${{ github.event.inputs.clusterName}}/role/${{ github.event.inputs.customerName}}-sa \
+          bound_service_account_names=${{ github.event.inputs.customerName}}-sa \
+          bound_service_account_namespaces=${{ github.event.inputs.customerName}} \
+          policies=${{ github.event.inputs.customerName }} \
+          ttl=24h
+
+      - name: create secrets
+        run: |
+          vault kv put -mount=customers ${{ github.event.inputs.customerName }}/configuration/database server=https://mongodb.com database=pentalog username=sa password=helloPASS
